@@ -1,7 +1,4 @@
-import tqdm
 import os
-import torch
-import argparse
 import time
 
 def run_neuralsat(args, onnx_path, vnnlib_path, output_path, timeout):
@@ -46,7 +43,7 @@ def run_neuralsat(args, onnx_path, vnnlib_path, output_path, timeout):
     os.chdir(args.home_dir)
     return status, runtime
 
-def run_neuralsat_from_src(args, new_model, num_inputs, vnnlib_path, input_split=True, device="cuda", timeout_each=1):
+def run_neuralsat_from_src(args, new_model, num_inputs, vnnlib_path, input_split=True, device="cuda", timeout_each=100):
     import sys
     sys.path.insert(0, args.verifier_dir)
     from verifier.verifier import Verifier
