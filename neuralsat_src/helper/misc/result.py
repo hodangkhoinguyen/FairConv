@@ -6,12 +6,14 @@ AbstractResults = namedtuple(
     (
         'objective_ids',
         'output_lbs', 
+        'output_ubs', 
         'masks', 'lAs', 'histories', 
         'lower_bounds', 'upper_bounds', 
         'input_lowers', 'input_uppers',
         'slopes', 'betas', 
         'cs', 'rhs',
-        'sat_solvers'
+        'sat_solvers',
+        'split_depth'
     ), 
     defaults=(None,) * 14
 )

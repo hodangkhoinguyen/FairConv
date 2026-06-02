@@ -59,7 +59,11 @@ class Verifier:
         
         # other verifier
         self.other = copy.deepcopy(self)
-        
+
+        self.falsified = 0
+        self.certified = 0
+        self.undecided = 0
+
     @beartype
     def get_objective(self: 'Verifier', dnf_objectives: 'DnfObjectives', max_domain: int):
         # objective = dnf_objectives.pop(1)
@@ -67,7 +71,7 @@ class Verifier:
         return objective
     
     @beartype
-    def verify(self: 'Verifier', dnf_objectives: 'DnfObjectives', preconditions: list = [], timeout: int | float = 3600.0, force_split: str | None = None) -> str:
+    def verify(self: 'Verifier', dnf_objectives: 'DnfObjectives', preconditions: list = [], timeout: int | float = 3600.0, force_split: str | None = None) -> dict:
         self.start_time = time.time()
         self.total_time = timeout
         self.status = self._verify(
@@ -76,18 +80,31 @@ class Verifier:
             timeout=timeout,
             force_split=force_split,
         )
+        for obj_id in self.status:
+            falsified = round(self.status[obj_id]["falsified"], 4) * 100
+            proved = round(self.status[obj_id]["proved"], 4) * 100
+            undecided = round(100 - falsified - proved, 2)
+            self.status[obj_id] = {
+                "falsified": falsified,
+                "proved": proved,
+                "undecided": undecided
+            }
         return self.status
     
     
     @beartype
-    def _verify(self: 'Verifier', dnf_objectives: 'DnfObjectives', preconditions: list, timeout: int | float = 3600.0, force_split: str | None = None) -> str:
+    def _verify(self: 'Verifier', dnf_objectives: 'DnfObjectives', preconditions: list, timeout: int | float = 3600.0, force_split: str | None = None) -> dict:
+        """
+        Return a quantitive verification result
+
+        Returns:
+            A tuple of Certified %, Falsified %, Undecided %
+        """
         if not len(dnf_objectives):
-            return ReturnStatus.UNSAT
-        
-        # attack
-        is_attacked, self.adv = self._pre_attack(copy.deepcopy(dnf_objectives), timeout=min(10.0, timeout * 0.1))
-        if is_attacked:
-            return ReturnStatus.SAT  
+            return 100.0, 0.0, 0.0
+
+        # Ensure it's always input_split
+        assert force_split == "input"
 
         # refine
         dnf_objectives, reference_bounds = self._preprocess(dnf_objectives, force_split=force_split)
@@ -97,28 +114,7 @@ class Verifier:
             
         if not len(dnf_objectives):
             return ReturnStatus.UNSAT
-        
-        # mip attack
-        is_attacked, self.adv = self._mip_attack(reference_bounds)
-        if is_attacked:
-            return ReturnStatus.SAT 
-        
-        if self._check_invoke_mip_presolving():
-            print('[+] Invoking MIP presolving')
-            try:
-                mip_verifier = MIPSolver(net=self.net, input_shape=self.input_shape)
-                status, self.adv = mip_verifier.verify(
-                    dnf_objective=copy.deepcopy(dnf_objectives), 
-                    timeout=0.2 * timeout,
-                )
-                if status in [ReturnStatus.SAT, ReturnStatus.UNSAT]:
-                    return status
-            except AttributeError:
-                if os.environ.get('NEURALSAT_DEBUG'):
-                    raise
-            except:
-                raise NotImplementedError('Unknown MIP solver error')
-        
+
         # FIXME: generalize this
         max_domain = min(self.batch, len(dnf_objectives))
         status = self._verify_with_restart(
@@ -128,16 +124,6 @@ class Verifier:
             reference_bounds=reference_bounds,
             max_domain=max_domain
         )
-        
-        while not status and max_domain > 1:
-            max_domain = max_domain // 10
-            status = self._verify_with_restart(
-                dnf_objectives=copy.deepcopy(dnf_objectives),
-                preconditions=preconditions,
-                timeout=timeout,
-                reference_bounds=reference_bounds,
-                max_domain=max_domain
-            )
             
         return status
         
@@ -151,7 +137,7 @@ class Verifier:
             
     @beartype    
     def _verify_with_restart(self: 'Verifier', dnf_objectives: 'DnfObjectives', preconditions: list, 
-                             timeout: int | float = 3600.0, reference_bounds: None | dict = None, max_domain: int = 1) -> str | None:
+                             timeout: int | float = 3600.0, reference_bounds: None | dict = None, max_domain: int = 1) -> dict:
         # verify
         while len(dnf_objectives):
             objective = self.get_objective(dnf_objectives, max_domain=max_domain)
@@ -209,6 +195,7 @@ class Verifier:
                     
                 # stats
                 self._save_stats()
+                return status
                 
                 # handle returning status
                 if status in [ReturnStatus.SAT, ReturnStatus.TIMEOUT, ReturnStatus.UNKNOWN, ReturnStatus.EARLY_STOP]:
@@ -243,7 +230,13 @@ class Verifier:
         assert len(ret.output_lbs) == len(objective.cs)
         if stop_criterion_batch_any(objective.rhs.to(self.device))(ret.output_lbs.to(self.device)).all():
             return []
-        
+
+        self.result = dict()
+        for idx in ret.objective_ids:
+            self.result[idx.item()] = {
+                "falsified": 0, "proved": 0
+            }
+
         # full slopes uses too much memory
         slopes = ret.slopes if self.input_split else new_slopes(ret.slopes, self.abstractor.net.final_name)
         
@@ -252,6 +245,7 @@ class Verifier:
             net=self.abstractor.net,
             objective_ids=ret.objective_ids,
             output_lbs=ret.output_lbs,
+            output_ubs=ret.output_ubs,
             input_lowers=ret.input_lowers,
             input_uppers=ret.input_uppers,
             lower_bounds=ret.lower_bounds, 
@@ -267,7 +261,7 @@ class Verifier:
         
         
     @beartype
-    def _verify_one(self: 'Verifier', objective, preconditions: dict, reference_bounds: dict | None, timeout: int | float) -> str:
+    def _verify_one(self: 'Verifier', objective, preconditions: dict, reference_bounds: dict | None, timeout: int | float) -> dict:
         # initialization
         try:
             self.domains_list = self._initialize(objective=objective, preconditions=preconditions, reference_bounds=reference_bounds)
@@ -315,10 +309,7 @@ class Verifier:
             if self._check_timeout(timeout):
                 return ReturnStatus.TIMEOUT
             
-            # check restart
-            if self._check_restart(start_time=start_time, start_iteration=start_iteration):
-                return ReturnStatus.RESTART
-        
+
             # check unsolvable
             if len(self.domains_list) > Settings.max_domains:
                 return ReturnStatus.UNKNOWN
@@ -331,54 +322,8 @@ class Verifier:
             if self.iteration >= Settings.max_iterations:
                 return ReturnStatus.EARLY_STOP
             
-        
-        return ReturnStatus.UNSAT
-    
-    
-    @beartype
-    def _check_restart(self: 'Verifier', start_time: float, start_iteration: int) -> bool:
-        if not Settings.use_restart:
-            return False
-        
-        if self.input_split:
-            if self.num_restart >= len(INPUT_SPLIT_RESTART_STRATEGIES):
-                return False
-            
-            if self.num_restart == len(INPUT_SPLIT_RESTART_STRATEGIES) - 1 and self.abstractor.method == 'crown-optimized':
-                if self.total_time - (time.time() - self.start_time) < 20.0: # restart to attack phase
-                    return True
-                else:
-                    return False
-        else:
-            if self.num_restart >= len(HIDDEN_SPLIT_RESTART_STRATEGIES):
-                return False
-        
-        # too late, don't restart
-        if time.time() - self.start_time > self.total_time * 0.9:
-            return False
-        
-        # restart time threshold
-        if time.time() - start_time > self.total_time * Settings.restart_max_runtime_percentage:
-            logger.debug(f'[Restart] Runtime exceeded {self.total_time * Settings.restart_max_runtime_percentage} seconds ({Settings.restart_max_runtime_percentage*100}%)')
-            return True
-        
-        # restart runtime threshold
-        if (self.iteration - start_iteration >= 20) and (time.time() - start_time > Settings.restart_max_runtime):
-            logger.debug(f'[Restart] Runtime exceeded {Settings.restart_max_runtime} seconds')
-            return True
-        
-        # restart domains threshold
-        max_branches = Settings.restart_current_input_branches if self.input_split else Settings.restart_current_hidden_branches
-        max_visited_branches = Settings.restart_visited_input_branches if self.input_split else Settings.restart_visited_hidden_branches
-        if len(self.domains_list) > max_branches:
-            logger.debug(f'[Restart] Number of remaining domains exceeded {max_branches} domains')
-            return True
-        
-        if self.domains_list.visited > max_visited_branches:
-            logger.debug(f'[Restart] Number of visited domains exceeded {max_visited_branches} domains')
-            return True
-        
-        return False
+        return self.result
+
     
     @beartype
     def _stop_gpu_tightening(self) -> bool:
@@ -437,12 +382,14 @@ class Verifier:
             return
 
         # step 5: complete assignments
-        self.adv, remain_idx = self._check_full_assignment(pick_ret)
-        if (self.adv is not None): 
-            return
+        # If input split, always return None, None
+        # self.adv, remain_idx = self._check_full_assignment(pick_ret)
+        # if (self.adv is not None): 
+        #     return
         
         # pruning/ filter
-        pruned_ret = _prune_domains(pick_ret, remain_idx) if remain_idx is not None else pick_ret
+        # remain_idx is always None for input split, so pick_ret
+        pruned_ret = pick_ret
         if not len(pruned_ret.input_lowers): 
             return
             
@@ -458,7 +405,18 @@ class Verifier:
 
         # step 8: pruning unverified branches
         tic = time.time()
-        self.domains_list.add(abstraction_ret, decisions)
+        proved_idx, falsified_idx = self.domains_list.add(abstraction_ret, decisions)
+
+        for idx in proved_idx:
+            obj_id = int(abstraction_ret.objective_ids[idx].item())
+            depth  = int(abstraction_ret.split_depth[idx].item())
+            self.result[obj_id]["proved"] += 1 / (2 ** depth)
+
+        for idx in falsified_idx:
+            obj_id = int(abstraction_ret.objective_ids[idx].item())
+            depth  = int(abstraction_ret.split_depth[idx].item())
+            self.result[obj_id]["falsified"] += 1 / (2 ** depth)
+
         add_time = time.time() - tic
 
         # statistics

@@ -74,7 +74,7 @@ class GlobalSettings(BaseSettings):
         # TODO: remove this
         # self.use_mip_verify = False
         # self.use_mip_tightening = False
-        # self.use_restart = False
+        self.use_restart = False
         # self.use_attack = False
         # self.mip_tightening_timeout_per_neuron = 2.0
         # self.restart_visited_hidden_branches = 100

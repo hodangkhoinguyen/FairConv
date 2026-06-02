@@ -301,8 +301,8 @@ def input_split_idx(self: 'abstractor.abstractor.NetworkAbstractor', input_lower
     input_lowers_cp[indices, idx] = split_value
     input_uppers_cp_tmp[indices, idx] = split_value
     
-    input_lowers_cp = torch.cat([input_lowers_cp, input_lowers_cp_tmp])
-    input_uppers_cp = torch.cat([input_uppers_cp, input_uppers_cp_tmp])
+    input_lowers_cp = torch.cat([input_lowers_cp, input_lowers_cp_tmp]) # [mid]       + [ori_lower]
+    input_uppers_cp = torch.cat([input_uppers_cp, input_uppers_cp_tmp]) # [ori_upper] + [mid]
 
     new_input_lowers = input_lowers_cp.reshape(-1, *self.input_shape[1:])
     new_input_uppers = input_uppers_cp.reshape(-1, *self.input_shape[1:])

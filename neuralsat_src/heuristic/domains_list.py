@@ -18,6 +18,7 @@ from abstractor.utils import _copy_history
 from heuristic.util import compute_masks
 from setting import Settings
 
+MAX_DEPTH_SPLIT = 20
 
 class DomainsList:
     
@@ -28,6 +29,7 @@ class DomainsList:
                  net: 'abstractor.auto_LiRPA.BoundedModule',
                  objective_ids: torch.Tensor,
                  output_lbs: torch.Tensor,
+                 output_ubs: torch.Tensor,
                  input_lowers: torch.Tensor, 
                  input_uppers: torch.Tensor, 
                  lower_bounds: dict | None, 
@@ -48,9 +50,20 @@ class DomainsList:
         self.all_conflict_clauses = {int(_): [] for _ in objective_ids}
         self.use_restart = Settings.use_restart and (lower_bounds is not None) and (not input_split)
         
-        # unverified indices 
-        remain_idx = torch.where((output_lbs.detach().cpu() <= rhs.detach().cpu()).all(1))[0]
-        
+        rhs_cpu = rhs.detach().cpu()
+        lbs_cpu = output_lbs.detach().cpu()
+        ubs_cpu = output_ubs.detach().cpu()
+
+        proved_mask    = ~(lbs_cpu <= rhs_cpu).all(dim=1)
+        falsified_mask = (ubs_cpu <= rhs_cpu).all(dim=1) & ~proved_mask
+
+        # unverified branches
+        remain_mask    = ~proved_mask & ~falsified_mask
+        remain_idx     = torch.where(remain_mask)[0]
+
+        self.init_proved_idx    = torch.where(proved_mask)[0]
+        self.init_falsified_idx = torch.where(falsified_mask)[0]
+
         # decisions
         all_histories = [_copy_history(histories) for _ in range(len(cs))] if not input_split else None
         all_betas = [None for i in range(len(cs))] if not input_split else None
@@ -78,10 +91,13 @@ class DomainsList:
         
         # output bounds
         self.all_output_lowers = TensorStorage(output_lbs[remain_idx].cpu())
+        self.all_output_uppers = TensorStorage(output_ubs[remain_idx].cpu())
         
         # properties
         self.all_cs = TensorStorage(cs[remain_idx].cpu())
         self.all_rhs = TensorStorage(rhs[remain_idx].cpu())
+
+        self.split_depth = TensorStorage(torch.tensor([0 for _ in remain_idx]).cpu())
     
         # alpha
         self.all_slopes = defaultdict(dict)
@@ -206,7 +222,8 @@ class DomainsList:
         
         # output bounds
         new_output_lowers = self.all_output_lowers.pop(batch).to(device=device, non_blocking=True)
-        
+        new_output_uppers = self.all_output_uppers.pop(batch).to(device=device, non_blocking=True)
+
         # properties
         new_cs = self.all_cs.pop(batch).to(device=device, non_blocking=True)
         new_rhs = self.all_rhs.pop(batch).to(device=device, non_blocking=True)
@@ -254,12 +271,16 @@ class DomainsList:
             assert len(new_lower_bounds[list(new_lower_bounds.keys())[0]]) == batch
             assert len(new_upper_bounds[list(new_upper_bounds.keys())[0]]) == batch
             assert len(new_lAs[list(new_lAs.keys())[0]]) == batch 
-        
+    
+    
+        new_split_depth = self.split_depth.pop(batch).to(device=device, non_blocking=True)
+
         self._check_consistent()
-        
+
         return AbstractResults(**{
             'objective_ids': new_objective_ids,
             'output_lbs': new_output_lowers,
+            'output_ubs': new_output_uppers,
             'input_lowers': new_input_lowers, 
             'input_uppers': new_input_uppers, 
             'masks': new_masks, 
@@ -272,24 +293,41 @@ class DomainsList:
             'cs': new_cs,
             'rhs': new_rhs,
             'sat_solvers': new_sat_solvers,
+            'split_depth': new_split_depth
         })
 
 
     @beartype
-    def add(self: 'DomainsList', domain_params: AbstractResults, decisions: list | torch.Tensor) -> None:
+    def add(self: 'DomainsList', domain_params: AbstractResults, decisions: list | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # assert decisions is not None
         batch = len(domain_params.input_lowers)
         assert batch > 0
-        
+
         # unverified indices
-        remaining_index = torch.where((domain_params.output_lbs.detach().cpu() <= domain_params.rhs.detach().cpu()).all(1))[0]
+        rhs_cpu  = domain_params.rhs.detach().cpu()
+        lbs_cpu  = domain_params.output_lbs.detach().cpu()
+        ubs_cpu  = domain_params.output_ubs.detach().cpu()
+        depths   = domain_params.split_depth.detach().cpu()   # (batch,)
+ 
+        proved_mask    = ~(lbs_cpu <= rhs_cpu).all(dim=1)
+        proved_index = torch.where(proved_mask)[0]
+
+        falsified_mask = (ubs_cpu <= rhs_cpu).all(dim=1) & ~proved_mask
+        falsified_index = torch.where(falsified_mask)[0]
+
+        depthcap_mask  = (depths >= MAX_DEPTH_SPLIT) & ~proved_mask & ~falsified_mask
+
+        remaining_mask = ~proved_mask & ~falsified_mask & ~depthcap_mask
+        remaining_index = torch.where(remaining_mask)[0]
+
         if os.environ.get('NEURALSAT_SYNTHETIC_BUG_DROP_PROBABILITY'):
             probability = float(os.environ.get('NEURALSAT_SYNTHETIC_BUG_DROP_PROBABILITY'))
             kept_mask = torch.rand(len(remaining_index)) > probability
             original_length = len(remaining_index)
             remaining_index = remaining_index[kept_mask]
             print(f'[!] Kept {len(remaining_index)}/{original_length} domains')
-        
+
+
         # hidden splitting
         if not self.input_split:
             # using restart
@@ -341,7 +379,8 @@ class DomainsList:
         
         # output bounds
         self.all_output_lowers.append(domain_params.output_lbs[remaining_index])
-        
+        self.all_output_uppers.append(domain_params.output_ubs[remaining_index])
+
         # properties
         self.all_cs.append(domain_params.cs[remaining_index])
         self.all_rhs.append(domain_params.rhs[remaining_index])
@@ -352,15 +391,20 @@ class DomainsList:
         # lAs
         [v.append(domain_params.lAs[k][remaining_index]) for k, v in self.all_lAs.items()] if self.all_lAs is not None else None
 
+        # split depths
+        self.split_depth.append(domain_params.split_depth[remaining_index])
+
         # proof
         if Settings.use_save_reasoning_step:
             self.reasoning_domains.add(
                 domain_params=domain_params, 
                 select_index=torch.tensor([i for i in range(len(domain_params.input_lowers)) if i not in remaining_index]).int(),
             )
-        
+
+
         # checking
         self._check_consistent()
+        return proved_index, falsified_index
         
 
     @beartype
@@ -394,7 +438,8 @@ class DomainsList:
 
         # output
         new_output_lowers = self.all_output_lowers[indices].to(device=device, non_blocking=True)
-        
+        new_output_uppers = self.all_output_uppers[indices].to(device=device, non_blocking=True)
+
         # properties
         # new_cs = self.all_cs[indices].to(device=device, non_blocking=True)
         new_rhs = self.all_rhs[indices].to(device=device, non_blocking=True)
@@ -408,6 +453,7 @@ class DomainsList:
             'lower_bounds': new_lower_bounds, 
             'upper_bounds': new_upper_bounds, 
             'output_lbs': new_output_lowers,
+            'output_ubs': new_output_uppers,
             # 'cs': new_cs,
             'rhs': new_rhs,
         })

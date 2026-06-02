@@ -323,16 +323,96 @@ class DecisionHeuristic:
     
     
     @beartype
-    def smart_input_branching(self: 'DecisionHeuristic', abstractor: 'abstractor.abstractor.NetworkAbstractor', 
-                        domain_params: AbstractResults) -> torch.Tensor:
-        lAs_factors = domain_params.lAs[abstractor.net.input_name[0]].flatten(2).abs().clamp(min=0.1)
-        diff = (domain_params.input_uppers - domain_params.input_lowers).flatten(1).unsqueeze(1)
-        objective = (domain_params.output_lbs - domain_params.rhs).unsqueeze(-1)
-        score = lAs_factors * diff + objective
-        score = score.amax(dim=-2)
-        decisions = torch.topk(score, 1, -1).indices
+    def smart_input_branching(self, abstractor, domain_params):
+        lAs   = domain_params.lAs[abstractor.net.input_name[0]].flatten(2).abs()
+        diff  = (domain_params.input_uppers - domain_params.input_lowers).flatten(1)
+        slack = domain_params.output_lbs - domain_params.rhs  # (batch, n_obj)
+
+        # How much each dim can improve any objective
+        bound_gain = (lAs * diff.unsqueeze(1)).amax(dim=1)  # (batch, n_dims)
+
+        # Prefer wider dims for volume coverage
+        width_bias = diff / (diff.amax(dim=1, keepdim=True) + 1e-8)
+
+        # Weight objectives by urgency — focus gain on most violated
+        urgency = torch.softmax(-slack, dim=1)                          # (batch, n_obj)
+        weighted_gain = (lAs * urgency.unsqueeze(-1)).sum(dim=1) * diff # (batch, n_dims)
+
+        score = 0.5 * bound_gain + 0.3 * weighted_gain + 0.2 * width_bias
+
+        decisions = torch.topk(score, 1, dim=-1).indices
         return decisions
 
+        # input_lowers = domain_params.input_lowers
+        # input_uppers = domain_params.input_uppers
+
+        # lAs  = domain_params.lAs[abstractor.net.input_name[0]].flatten(2).abs()  # (batch, n_obj, n_dims)
+        # diff = (input_uppers - input_lowers).flatten(1)                           # (batch, n_dims)
+        # slack = domain_params.output_lbs - domain_params.rhs                      # (batch, n_obj)
+
+        # # Original's core — keep this, it works
+        # bound_gain = (lAs * diff.unsqueeze(1)).amax(dim=1)   # (batch, n_dims)
+        # width_bias = diff / (diff.amax(dim=1, keepdim=True) + 1e-8)
+
+        # # Only addition: urgency weighting via slack
+        # urgency = torch.softmax(-slack, dim=1)                                    # (batch, n_obj)
+        # weighted_gain = (lAs * urgency.unsqueeze(-1)).sum(dim=1) * diff           # (batch, n_dims)
+
+        # score = 0.5 * bound_gain + 0.3 * weighted_gain + 0.2 * width_bias
+
+        # decisions = torch.topk(score, 1, dim=-1).indices
+        # return decisions
+
+    # def smart_input_branching(self: 'DecisionHeuristic', abstractor: 'abstractor.abstractor.NetworkAbstractor', 
+    #                     domain_params: AbstractResults) -> torch.Tensor:
+        
+    #     input_lowers = domain_params.input_lowers  # (batch, *input_shape)
+    #     input_uppers = domain_params.input_uppers
+    #     output_lbs   = domain_params.output_lbs    # (batch, n_objectives)
+    #     rhs          = domain_params.rhs           # (batch, n_objectives)
+    #     split_depth  = domain_params.split_depth   # (batch,)
+        
+    #     # lA sensitivity: how much does splitting dim d affect the output bound
+    #     lAs = domain_params.lAs[abstractor.net.input_name[0]].flatten(2).abs()  # (batch, n_obj, n_input_dims)
+    #     diff = (input_uppers - input_lowers).flatten(1)  # (batch, n_input_dims)
+
+    #     # === Score 1: Bound improvement potential ===
+    #     # How much can splitting this dim tighten the output bound
+    #     bound_gain = (lAs * diff.unsqueeze(1)).amax(dim=1)  # (batch, n_input_dims)
+
+    #     # === Score 2: Closeness to resolution ===
+    #     # Negative slack: how far are we from certifying (lbs >= rhs)
+    #     # More negative = further from proved, so we want dims that close this gap fastest
+    #     slack = (output_lbs - rhs)  # (batch, n_obj)  negative = unproved
+    #     # weight lAs by slack urgency: prioritize dims that help the worst-violated objectives
+    #     urgency = torch.softmax(-slack, dim=1)  # (batch, n_obj) — focus on most violated
+    #     weighted_gain = (lAs * urgency.unsqueeze(-1)).sum(dim=1) * diff  # (batch, n_input_dims)
+
+    #     # === Score 3: Dimension width bias ===
+    #     # Prefer wider dims — splitting them covers more volume per split (1/2^d efficiency)
+    #     width_bias = diff / (diff.sum(dim=1, keepdim=True) + 1e-8)  # (batch, n_input_dims)
+
+    #     # === Score 4: Depth efficiency ===
+    #     # At higher depths, prioritize dims that are more likely to falsify quickly
+    #     # (ubs close to rhs = potential counter-example)
+    #     output_ubs = domain_params.output_ubs  # (batch, n_obj)
+    #     falsify_proximity = torch.relu(rhs - output_ubs)  # (batch, n_obj) positive = near falsified
+    #     falsify_score = (lAs * falsify_proximity.unsqueeze(-1)).sum(dim=1) * diff  # (batch, n_input_dims)
+
+    #     # === Depth-adaptive weighting ===
+    #     # Early splits (low depth): explore broadly, maximize bound gain
+    #     # Late splits (high depth): focus on resolving — weight urgency and falsify more
+    #     depth_weight = torch.sigmoid(split_depth.float() / 10.0).unsqueeze(1)  # (batch, 1) in [0.5, 1]
+
+    #     score = (
+    #         (1.0 - depth_weight) * bound_gain        # broad exploration early
+    #         + depth_weight       * weighted_gain      # urgency-driven late
+    #         + 0.3                * width_bias         # always prefer wide dims
+    #         + depth_weight       * falsify_score      # falsification opportunity
+    #     )
+
+    #     decisions = torch.topk(score, 1, dim=-1).indices  # (batch, 1)
+    #     return decisions
 
     @beartype
     def naive_hidden_branching(self: 'DecisionHeuristic', abstractor: 'abstractor.abstractor.NetworkAbstractor', domain_params: AbstractResults, mode: str) -> list[list]:

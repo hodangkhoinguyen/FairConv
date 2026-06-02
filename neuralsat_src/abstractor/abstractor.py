@@ -245,21 +245,21 @@ class NetworkAbstractor:
         
         if self.method not in ['crown-optimized']:
             with torch.no_grad():
-                lb, _ = self.net.compute_bounds(
+                lb, ub = self.net.compute_bounds(
                     x=(x,), 
                     C=objective.cs, 
                     method=self.method, 
                     reference_bounds=reference_bounds,
-                    bound_upper=False,
                 )
             logger.info(f'Initial bounds (first 10): {lb.detach().cpu().flatten()[:10]}')
             if stop_criterion_func(lb).all().item():
-                return AbstractResults(**{'output_lbs': lb})
+                return AbstractResults(**{'output_lbs': lb, 'output_ubs': ub})
             
             if short_cut:
                 return AbstractResults(**{
                     'objective_ids': getattr(objective, 'ids', None),
                     'output_lbs': lb, 
+                    'output_ubs': ub, 
                     'lAs': self.get_lAs(), 
                     'slopes': self.get_slope(), 
                     'cs': objective.cs,
@@ -275,6 +275,7 @@ class NetworkAbstractor:
             return AbstractResults(**{
                 'objective_ids': getattr(objective, 'ids', None),
                 'output_lbs': lb, 
+                'output_ubs': ub, 
                 'lAs': self.get_lAs(), 
                 'lower_bounds': lower_bounds, 
                 'upper_bounds': upper_bounds, 
@@ -287,11 +288,10 @@ class NetworkAbstractor:
             })
 
         # initial bounds
-        lb_init, _, aux_reference_bounds = self.net.init_alpha(
+        lb_init, ub_init, aux_reference_bounds = self.net.init_alpha(
             x=(x,), 
             share_alphas=Settings.share_alphas, 
             c=objective.cs, 
-            bound_upper=False,
         )
         
         if os.environ.get('NEURALSAT_DEBUG'):
@@ -300,20 +300,19 @@ class NetworkAbstractor:
         logger.info(f'Initial bounds (first 10): {lb_init.detach().cpu().flatten()[:10]}')
         
         if stop_criterion_func(lb_init).all().item():
-            return AbstractResults(**{'output_lbs': lb_init})
+            return AbstractResults(**{'output_lbs': lb_init, 'output_ubs': ub_init})
 
         # self.update_refined_beta(init_betas, batch=len(objective.cs))
-        lb, _ = self.net.compute_bounds(
+        lb, ub = self.net.compute_bounds(
             x=(x,), 
             C=objective.cs, 
             method='crown-optimized',
             aux_reference_bounds=aux_reference_bounds, 
             reference_bounds=reference_bounds,
-            bound_upper=False,
         )
         logger.info(f'Initial optimized bounds (first 10): {lb.detach().cpu().flatten()[:10]}')
         if stop_criterion_func(lb).all().item():
-            return AbstractResults(**{'output_lbs': lb})
+            return AbstractResults(**{'output_lbs': lb, 'output_ubs': ub})
         
         # reorganize tensors
         with torch.no_grad():
@@ -322,6 +321,7 @@ class NetworkAbstractor:
         return AbstractResults(**{
             'objective_ids': objective.ids,
             'output_lbs': lower_bounds[self.net.final_name], 
+            'output_ubs': upper_bounds[self.net.final_name], 
             'lAs': self.get_lAs(), 
             'lower_bounds': lower_bounds, 
             'upper_bounds': upper_bounds, 
@@ -371,15 +371,14 @@ class NetworkAbstractor:
             
             # compute outputs
             with torch.no_grad():
-                double_output_lbs, _, = self.net.compute_bounds(
+                double_output_lbs, double_output_ubs, = self.net.compute_bounds(
                     x=(new_x,), 
                     C=double_cs, 
                     method='backward', 
                     reuse_alpha=self.method == 'crown-optimized',
                     interm_bounds=new_intermediate_layer_bounds,
-                    bound_upper=False,
                 )
-            return AbstractResults(**{'output_lbs': double_output_lbs})
+            return AbstractResults(**{'output_lbs': double_output_lbs, 'output_ubs': double_output_ubs})
 
         # 2 * batch
         assert len(decisions) == len(domain_params.objective_ids)
@@ -429,6 +428,7 @@ class NetworkAbstractor:
         return AbstractResults(**{
             'objective_ids': double_objective_ids,
             'output_lbs': double_lower_bounds[self.net.final_name], 
+            'output_lbs': double_upper_bounds[self.net.final_name], 
             'input_lowers': double_input_lowers, 
             'input_uppers': double_input_uppers,
             'lAs': double_lAs, 
@@ -465,6 +465,7 @@ class NetworkAbstractor:
         double_objective_ids = torch.cat([domain_params.objective_ids, domain_params.objective_ids], dim=0)
         double_cs = torch.cat([domain_params.cs, domain_params.cs], dim=0)
         double_rhs = torch.cat([domain_params.rhs, domain_params.rhs], dim=0)
+        double_depth = torch.cat([domain_params.split_depth.clone() + 1, domain_params.split_depth.clone() + 1], dim=0)
         
         # set slope again since batch might change
         if len(domain_params.slopes) > 0: 
@@ -473,13 +474,12 @@ class NetworkAbstractor:
         # set optimization parameters
         self.net.set_bound_opts(get_input_opt_params(stop_criterion_batch_any(double_rhs)))
         
-        double_output_lbs, _ = self.net.compute_bounds(
+        double_output_lbs, double_output_ubs = self.net.compute_bounds(
             x=(new_x,), 
             C=double_cs, 
             method=self.method,
             decision_thresh=double_rhs,
             reference_bounds=self.init_reference_bounds,
-            bound_upper=False,
         )
 
         with torch.no_grad():
@@ -495,6 +495,7 @@ class NetworkAbstractor:
         return AbstractResults(**{
             'objective_ids': double_objective_ids,
             'output_lbs': double_output_lbs, 
+            'output_ubs': double_output_ubs, 
             'input_lowers': new_input_lowers, 
             'input_uppers': new_input_uppers,
             'lower_bounds': double_lower_bounds, 
@@ -503,6 +504,7 @@ class NetworkAbstractor:
             'lAs': double_lAs, 
             'cs': double_cs, 
             'rhs': double_rhs, 
+            'split_depth': double_depth
         })
         
     @beartype
@@ -526,12 +528,14 @@ class NetworkAbstractor:
         double_rhs = torch.cat([domain_params.rhs, domain_params.rhs], dim=0)
         
         sequential_output_lbs = []
+        sequential_output_ubs = []
+
         for b in tqdm.tqdm(range(2*batch), desc=f'_forward_input_sequential {double_cs.device}'):
             # create new inputs
             x_b = self.new_input(x_L=new_input_lowers[b:b+1], x_U=new_input_uppers[b:b+1])
             self.net.set_bound_opts(get_input_opt_params(stop_criterion_batch_any(double_rhs[b:b+1])))
             
-            output_lb, _ = self.net.compute_bounds(
+            output_lb, output_ub = self.net.compute_bounds(
                 x=(x_b,), 
                 C=double_cs[b:b+1], 
                 method=self.method,
@@ -539,11 +543,14 @@ class NetworkAbstractor:
                 reference_bounds=self.init_reference_bounds,
             )
             sequential_output_lbs.append(output_lb[0])
+            sequential_output_ubs.append(output_ub[0])
         sequential_output_lbs = torch.stack(sequential_output_lbs)
+        sequential_output_ubs = torch.stack(sequential_output_ubs)
 
         return AbstractResults(**{
             'objective_ids': double_objective_ids,
             'output_lbs': sequential_output_lbs, 
+            'output_ubs': sequential_output_ubs, 
             'input_lowers': new_input_lowers, 
             'input_uppers': new_input_uppers,
             'cs': double_cs, 
