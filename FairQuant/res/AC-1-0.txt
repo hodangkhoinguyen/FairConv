@@ -1,0 +1,2 @@
+Took 1.46 seconds | 47679 solved subproblems | 4549 #Cex
+cer_rate: 90.46%, fal_rate: 0.00%, und_rate: 9.53%
